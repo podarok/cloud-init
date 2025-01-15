@@ -12,7 +12,7 @@ from cloudinit.distros.parsers import chop_comment
 # See: man hosts
 # or https://linux.die.net/man/5/hosts
 # or https://www.freebsd.org/doc/en_US.ISO8859-1/books/handbook/configtuning-configfiles.html # noqa
-class HostsConf(object):
+class HostsConf:
     def __init__(self, text):
         self._text = text
         self._contents = None
@@ -24,7 +24,7 @@ class HostsConf(object):
     def get_entry(self, ip):
         self.parse()
         options = []
-        for (line_type, components) in self._contents:
+        for line_type, components in self._contents:
             if line_type == "option":
                 (pieces, _tail) = components
                 if len(pieces) and pieces[0] == ip:
@@ -34,7 +34,7 @@ class HostsConf(object):
     def del_entries(self, ip):
         self.parse()
         n_entries = []
-        for (line_type, components) in self._contents:
+        for line_type, components in self._contents:
             if line_type != "option":
                 n_entries.append((line_type, components))
                 continue
@@ -68,7 +68,7 @@ class HostsConf(object):
     def __str__(self):
         self.parse()
         contents = StringIO()
-        for (line_type, components) in self._contents:
+        for line_type, components in self._contents:
             if line_type == "blank":
                 contents.write("%s\n" % (components[0]))
             elif line_type == "all_comment":
@@ -79,6 +79,3 @@ class HostsConf(object):
                 pieces = "\t".join(pieces)
                 contents.write("%s%s\n" % (pieces, tail))
         return contents.getvalue()
-
-
-# vi: ts=4 expandtab

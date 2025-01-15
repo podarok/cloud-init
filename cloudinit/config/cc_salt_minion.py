@@ -2,66 +2,40 @@
 #
 # This file is part of cloud-init. See LICENSE file for license information.
 
-"""
-Salt Minion
------------
-**Summary:** set up and run salt minion
+"""Salt Minion: Setup and run salt minion"""
 
-This module installs, configures and starts salt minion. If the ``salt_minion``
-key is present in the config parts, then salt minion will be installed and
-started. Configuration for salt minion can be specified in the ``conf`` key
-under ``salt_minion``. Any conf values present there will be assigned in
-``/etc/salt/minion``. The public and private keys to use for salt minion can be
-specified with ``public_key`` and ``private_key`` respectively. Optionally if
-you have a custom package name, service name or config directory you can
-specify them with ``pkg_name``, ``service_name`` and ``config_dir``.
-
-**Internal name:** ``cc_salt_minion``
-
-**Module frequency:** per instance
-
-**Supported distros:** all
-
-**Config keys**::
-
-    salt_minion:
-        pkg_name: 'salt-minion'
-        service_name: 'salt-minion'
-        config_dir: '/etc/salt'
-        conf:
-            master: salt.example.com
-        grains:
-            role:
-                - web
-        public_key: |
-            ------BEGIN PUBLIC KEY-------
-            <key data>
-            ------END PUBLIC KEY-------
-        private_key: |
-            ------BEGIN PRIVATE KEY------
-            <key data>
-            ------END PRIVATE KEY-------
-"""
-
+import logging
 import os
 
 from cloudinit import safeyaml, subp, util
-from cloudinit.distros import rhel_util
+from cloudinit.cloud import Cloud
+from cloudinit.config import Config
+from cloudinit.config.schema import MetaSchema
+from cloudinit.distros import ALL_DISTROS
+from cloudinit.settings import PER_INSTANCE
+
+meta: MetaSchema = {
+    "id": "cc_salt_minion",
+    "distros": [ALL_DISTROS],
+    "frequency": PER_INSTANCE,
+    "activate_by_schema_keys": ["salt_minion"],
+}
+
+LOG = logging.getLogger(__name__)
 
 # Note: see https://docs.saltstack.com/en/latest/topics/installation/
 # Note: see https://docs.saltstack.com/en/latest/ref/configuration/
 
 
-class SaltConstants(object):
+class SaltConstants:
     """
     defines default distribution specific salt variables
     """
 
     def __init__(self, cfg):
-
         # constants tailored for FreeBSD
         if util.is_FreeBSD():
-            self.pkg_name = "py36-salt"
+            self.pkg_name = "py-salt"
             self.srv_name = "salt_minion"
             self.conf_dir = "/usr/local/etc/salt"
         # constants for any other OS
@@ -80,10 +54,10 @@ class SaltConstants(object):
         )
 
 
-def handle(name, cfg, cloud, log, _args):
+def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
     # If there isn't a salt key in the configuration don't do anything
     if "salt_minion" not in cfg:
-        log.debug(
+        LOG.debug(
             "Skipping module named %s, no 'salt_minion' key in configuration",
             name,
         )
@@ -93,17 +67,19 @@ def handle(name, cfg, cloud, log, _args):
     const = SaltConstants(cfg=s_cfg)
 
     # Start by installing the salt package ...
-    cloud.distro.install_packages(const.pkg_name)
+    cloud.distro.install_packages([const.pkg_name])
 
     # Ensure we can configure files at the right dir
     util.ensure_dir(const.conf_dir)
+
+    minion_data = None
 
     # ... and then update the salt configuration
     if "conf" in s_cfg:
         # Add all sections from the conf object to minion config file
         minion_config = os.path.join(const.conf_dir, "minion")
-        minion_data = safeyaml.dumps(s_cfg.get("conf"))
-        util.write_file(minion_config, minion_data)
+        minion_data = s_cfg.get("conf")
+        util.write_file(minion_config, safeyaml.dumps(minion_data))
 
     if "grains" in s_cfg:
         # add grains to /etc/salt/grains
@@ -125,16 +101,19 @@ def handle(name, cfg, cloud, log, _args):
             util.write_file(pub_name, s_cfg["public_key"])
             util.write_file(pem_name, s_cfg["private_key"])
 
-    # we need to have the salt minion service enabled in rc in order to be
-    # able to start the service. this does only apply on FreeBSD servers.
-    if cloud.distro.osfamily == "freebsd":
-        rhel_util.update_sysconfig_file(
-            "/etc/rc.conf", {"salt_minion_enable": "YES"}
-        )
+    minion_daemon = not bool(
+        minion_data and minion_data.get("file_client") == "local"
+    )
 
-    # restart salt-minion. 'service' will start even if not started. if it
-    # was started, it needs to be restarted for config change.
-    subp.subp(["service", const.srv_name, "restart"], capture=False)
+    cloud.distro.manage_service(
+        "enable" if minion_daemon else "disable", const.srv_name
+    )
+    cloud.distro.manage_service(
+        "restart" if minion_daemon else "stop", const.srv_name
+    )
 
-
-# vi: ts=4 expandtab
+    if not minion_daemon:
+        # if salt-minion was configured as masterless, we should not run
+        # salt-minion as a daemon
+        # Note: see https://docs.saltproject.io/en/latest/topics/tutorials/quickstart.html  # noqa: E501
+        subp.subp(["salt-call", "--local", "state.apply"], capture=False)

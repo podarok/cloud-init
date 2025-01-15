@@ -7,234 +7,31 @@
 """Write Files: write arbitrary files"""
 
 import base64
+import logging
 import os
-from textwrap import dedent
+from typing import Optional
 
-from cloudinit import log as logging
-from cloudinit import util
-from cloudinit.config.schema import get_meta_doc, validate_cloudconfig_schema
+from cloudinit import url_helper, util
+from cloudinit.cloud import Cloud
+from cloudinit.config import Config
+from cloudinit.config.schema import MetaSchema
 from cloudinit.settings import PER_INSTANCE
 
-frequency = PER_INSTANCE
-
-DEFAULT_OWNER = "root:root"
 DEFAULT_PERMS = 0o644
 DEFAULT_DEFER = False
-UNKNOWN_ENC = "text/plain"
+TEXT_PLAIN_ENC = "text/plain"
 
 LOG = logging.getLogger(__name__)
 
-distros = ["all"]
-
-# The schema definition for each cloud-config module is a strict contract for
-# describing supported configuration parameters for each cloud-config section.
-# It allows cloud-config to validate and alert users to invalid or ignored
-# configuration options before actually attempting to deploy with said
-# configuration.
-
-supported_encoding_types = [
-    "gz",
-    "gzip",
-    "gz+base64",
-    "gzip+base64",
-    "gz+b64",
-    "gzip+b64",
-    "b64",
-    "base64",
-]
-
-meta = {
+meta: MetaSchema = {
     "id": "cc_write_files",
-    "name": "Write Files",
-    "title": "write arbitrary files",
-    "description": dedent(
-        """\
-        Write out arbitrary content to files, optionally setting permissions.
-        Parent folders in the path are created if absent.
-        Content can be specified in plain text or binary. Data encoded with
-        either base64 or binary gzip data can be specified and will be decoded
-        before being written. For empty file creation, content can be omitted.
-
-    .. note::
-        if multiline data is provided, care should be taken to ensure that it
-        follows yaml formatting standards. to specify binary data, use the yaml
-        option ``!!binary``
-
-    .. note::
-        Do not write files under /tmp during boot because of a race with
-        systemd-tmpfiles-clean that can cause temp files to get cleaned during
-        the early boot process. Use /run/somedir instead to avoid race
-        LP:1707222."""
-    ),
-    "distros": distros,
-    "examples": [
-        dedent(
-            """\
-        # Write out base64 encoded content to /etc/sysconfig/selinux
-        write_files:
-        - encoding: b64
-          content: CiMgVGhpcyBmaWxlIGNvbnRyb2xzIHRoZSBzdGF0ZSBvZiBTRUxpbnV4...
-          owner: root:root
-          path: /etc/sysconfig/selinux
-          permissions: '0644'
-        """
-        ),
-        dedent(
-            """\
-        # Appending content to an existing file
-        write_files:
-        - content: |
-            15 * * * * root ship_logs
-          path: /etc/crontab
-          append: true
-        """
-        ),
-        dedent(
-            """\
-        # Provide gziped binary content
-        write_files:
-        - encoding: gzip
-          content: !!binary |
-              H4sIAIDb/U8C/1NW1E/KzNMvzuBKTc7IV8hIzcnJVyjPL8pJ4QIA6N+MVxsAAAA=
-          path: /usr/bin/hello
-          permissions: '0755'
-        """
-        ),
-        dedent(
-            """\
-        # Create an empty file on the system
-        write_files:
-        - path: /root/CLOUD_INIT_WAS_HERE
-        """
-        ),
-        dedent(
-            """\
-        # Defer writing the file until after the package (Nginx) is
-        # installed and its user is created alongside
-        write_files:
-        - path: /etc/nginx/conf.d/example.com.conf
-          content: |
-            server {
-                server_name example.com;
-                listen 80;
-                root /var/www;
-                location / {
-                    try_files $uri $uri/ $uri.html =404;
-                }
-            }
-          owner: 'nginx:nginx'
-          permissions: '0640'
-          defer: true
-        """
-        ),
-    ],
-    "frequency": frequency,
+    "distros": ["all"],
+    "frequency": PER_INSTANCE,
+    "activate_by_schema_keys": ["write_files"],
 }
 
-schema = {
-    "type": "object",
-    "properties": {
-        "write_files": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": dedent(
-                            """\
-                            Path of the file to which ``content`` is decoded
-                            and written
-                        """
-                        ),
-                    },
-                    "content": {
-                        "type": "string",
-                        "default": "",
-                        "description": dedent(
-                            """\
-                            Optional content to write to the provided ``path``.
-                            When content is present and encoding is not '%s',
-                            decode the content prior to writing. Default:
-                            **''**
-                        """
-                            % UNKNOWN_ENC
-                        ),
-                    },
-                    "owner": {
-                        "type": "string",
-                        "default": DEFAULT_OWNER,
-                        "description": dedent(
-                            """\
-                            Optional owner:group to chown on the file. Default:
-                            **{owner}**
-                        """.format(
-                                owner=DEFAULT_OWNER
-                            )
-                        ),
-                    },
-                    "permissions": {
-                        "type": "string",
-                        "default": oct(DEFAULT_PERMS).replace("o", ""),
-                        "description": dedent(
-                            """\
-                            Optional file permissions to set on ``path``
-                            represented as an octal string '0###'. Default:
-                            **'{perms}'**
-                        """.format(
-                                perms=oct(DEFAULT_PERMS).replace("o", "")
-                            )
-                        ),
-                    },
-                    "encoding": {
-                        "type": "string",
-                        "default": UNKNOWN_ENC,
-                        "enum": supported_encoding_types,
-                        "description": dedent(
-                            """\
-                            Optional encoding type of the content. Default is
-                            **text/plain** and no content decoding is
-                            performed. Supported encoding types are:
-                            %s."""
-                            % ", ".join(supported_encoding_types)
-                        ),
-                    },
-                    "append": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": dedent(
-                            """\
-                            Whether to append ``content`` to existing file if
-                            ``path`` exists. Default: **false**.
-                        """
-                        ),
-                    },
-                    "defer": {
-                        "type": "boolean",
-                        "default": DEFAULT_DEFER,
-                        "description": dedent(
-                            """\
-                            Defer writing the file until 'final' stage, after
-                            users were created, and packages were installed.
-                            Default: **{defer}**.
-                        """.format(
-                                defer=DEFAULT_DEFER
-                            )
-                        ),
-                    },
-                },
-                "required": ["path"],
-                "additionalProperties": False,
-            },
-        }
-    },
-}
 
-__doc__ = get_meta_doc(meta, schema)  # Supplement python help()
-
-
-def handle(name, cfg, _cloud, log, _args):
-    validate_cloudconfig_schema(cfg, schema)
+def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
     file_list = cfg.get("write_files", [])
     filtered_files = [
         f
@@ -242,13 +39,14 @@ def handle(name, cfg, _cloud, log, _args):
         if not util.get_cfg_option_bool(f, "defer", DEFAULT_DEFER)
     ]
     if not filtered_files:
-        log.debug(
+        LOG.debug(
             "Skipping module named %s,"
             " no/empty 'write_files' key in configuration",
             name,
         )
         return
-    write_files(name, filtered_files)
+    ssl_details = util.fetch_ssl_details(cloud.paths)
+    write_files(name, filtered_files, cloud.distro.default_owner, ssl_details)
 
 
 def canonicalize_extraction(encoding_type):
@@ -262,21 +60,25 @@ def canonicalize_extraction(encoding_type):
     # Yaml already encodes binary data as base64 if it is given to the
     # yaml file as binary, so those will be automatically decoded for you.
     # But the above b64 is just for people that are more 'comfortable'
-    # specifing it manually (which might be a possiblity)
+    # specifying it manually (which might be a possibility)
     if encoding_type in ["b64", "base64"]:
         return ["application/base64"]
+    if encoding_type == TEXT_PLAIN_ENC:
+        return [TEXT_PLAIN_ENC]
     if encoding_type:
         LOG.warning(
-            "Unknown encoding type %s, assuming %s", encoding_type, UNKNOWN_ENC
+            "Unknown encoding type %s, assuming %s",
+            encoding_type,
+            TEXT_PLAIN_ENC,
         )
-    return [UNKNOWN_ENC]
+    return [TEXT_PLAIN_ENC]
 
 
-def write_files(name, files):
+def write_files(name, files, owner: str, ssl_details: Optional[dict] = None):
     if not files:
         return
 
-    for (i, f_info) in enumerate(files):
+    for i, f_info in enumerate(files):
         path = f_info.get("path")
         if not path:
             LOG.warning(
@@ -286,12 +88,29 @@ def write_files(name, files):
             )
             continue
         path = os.path.abspath(path)
-        extractions = canonicalize_extraction(f_info.get("encoding"))
-        contents = extract_contents(f_info.get("content", ""), extractions)
-        (u, g) = util.extract_usergroup(f_info.get("owner", DEFAULT_OWNER))
+        # Read content from provided URL, if any, or decode from inline
+        contents = read_url_or_decode(
+            f_info.get("source", None),
+            ssl_details,
+            f_info.get("content", None),
+            f_info.get("encoding", None),
+        )
+        if contents is None:
+            LOG.warning(
+                "No content could be loaded for entry %s in module %s;"
+                " skipping",
+                i + 1,
+                name,
+            )
+            continue
+        # Only create the file if content exists. This will not happen, for
+        # example, if the URL fails and no inline content was provided
+        (u, g) = util.extract_usergroup(f_info.get("owner", owner))
         perms = decode_perms(f_info.get("permissions"), DEFAULT_PERMS)
         omode = "ab" if util.get_cfg_option_bool(f_info, "append") else "wb"
-        util.write_file(path, contents, omode=omode, mode=perms)
+        util.write_file(
+            path, contents, omode=omode, mode=perms, user=u, group=g
+        )
         util.chownbyname(path, u, g)
 
 
@@ -316,6 +135,43 @@ def decode_perms(perm, default):
         return default
 
 
+def read_url_or_decode(source, ssl_details, content, encoding):
+    url = None if source is None else source.get("uri", None)
+    use_url = bool(url)
+    # Special case: empty URL and content. Write a blank file
+    if content is None and not use_url:
+        return ""
+    # Fetch file content from source URL, if provided
+    result = None
+    if use_url:
+        try:
+            # NOTE: These retry parameters are arbitrarily chosen defaults.
+            # They have no significance, and may be changed if appropriate
+            result = url_helper.read_file_or_url(
+                url,
+                headers=source.get("headers", None),
+                retries=3,
+                sec_between=3,
+                ssl_details=ssl_details,
+            ).contents
+        except Exception:
+            util.logexc(
+                LOG,
+                'Failed to retrieve contents from source "%s"; falling back to'
+                ' data from "contents" key',
+                url,
+            )
+            use_url = False
+    # If inline content is provided, and URL is not provided or is
+    # inaccessible, parse the former
+    if content is not None and not use_url:
+        # NOTE: This is not simply an "else"! Notice that `use_url` can change
+        # in the previous "if" block
+        extractions = canonicalize_extraction(encoding)
+        result = extract_contents(content, extractions)
+    return result
+
+
 def extract_contents(contents, extraction_types):
     result = contents
     for t in extraction_types:
@@ -323,9 +179,6 @@ def extract_contents(contents, extraction_types):
             result = util.decomp_gzip(result, quiet=False, decode=False)
         elif t == "application/base64":
             result = base64.b64decode(result)
-        elif t == UNKNOWN_ENC:
+        elif t == TEXT_PLAIN_ENC:
             pass
     return result
-
-
-# vi: ts=4 expandtab

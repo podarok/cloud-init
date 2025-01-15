@@ -1,11 +1,15 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 
-from cloudinit import settings, sources, type_utils
+from unittest.mock import patch
+
+from cloudinit import importer, settings, sources, type_utils
 from cloudinit.sources import DataSource
+from cloudinit.sources import DataSourceAkamai as Akamai
 from cloudinit.sources import DataSourceAliYun as AliYun
 from cloudinit.sources import DataSourceAltCloud as AltCloud
 from cloudinit.sources import DataSourceAzure as Azure
 from cloudinit.sources import DataSourceBigstep as Bigstep
+from cloudinit.sources import DataSourceCloudCIX as CloudCIX
 from cloudinit.sources import DataSourceCloudSigma as CloudSigma
 from cloudinit.sources import DataSourceCloudStack as CloudStack
 from cloudinit.sources import DataSourceConfigDrive as ConfigDrive
@@ -19,6 +23,7 @@ from cloudinit.sources import DataSourceLXD as LXD
 from cloudinit.sources import DataSourceMAAS as MAAS
 from cloudinit.sources import DataSourceNoCloud as NoCloud
 from cloudinit.sources import DataSourceNone as DSNone
+from cloudinit.sources import DataSourceNWCS as NWCS
 from cloudinit.sources import DataSourceOpenNebula as OpenNebula
 from cloudinit.sources import DataSourceOpenStack as OpenStack
 from cloudinit.sources import DataSourceOracle as Oracle
@@ -29,9 +34,11 @@ from cloudinit.sources import DataSourceSmartOS as SmartOS
 from cloudinit.sources import DataSourceUpCloud as UpCloud
 from cloudinit.sources import DataSourceVMware as VMware
 from cloudinit.sources import DataSourceVultr as Vultr
+from cloudinit.sources import DataSourceWSL as WSL
 from tests.unittests import helpers as test_helpers
 
 DEFAULT_LOCAL = [
+    AliYun.DataSourceAliYunLocal,
     Azure.DataSourceAzure,
     CloudSigma.DataSourceCloudSigma,
     ConfigDrive.DataSourceConfigDrive,
@@ -40,6 +47,7 @@ DEFAULT_LOCAL = [
     Hetzner.DataSourceHetzner,
     IBMCloud.DataSourceIBMCloud,
     LXD.DataSourceLXD,
+    MAAS.DataSourceMAASLocal,
     NoCloud.DataSourceNoCloud,
     OpenNebula.DataSourceOpenNebula,
     Oracle.DataSourceOracle,
@@ -52,6 +60,9 @@ DEFAULT_LOCAL = [
     Scaleway.DataSourceScaleway,
     UpCloud.DataSourceUpCloudLocal,
     VMware.DataSourceVMware,
+    NWCS.DataSourceNWCS,
+    Akamai.DataSourceAkamaiLocal,
+    WSL.DataSourceWSL,
 ]
 
 DEFAULT_NETWORK = [
@@ -66,9 +77,12 @@ DEFAULT_NETWORK = [
     MAAS.DataSourceMAAS,
     NoCloud.DataSourceNoCloudNet,
     OpenStack.DataSourceOpenStack,
+    Oracle.DataSourceOracleNet,
     OVF.DataSourceOVFNet,
     UpCloud.DataSourceUpCloud,
+    Akamai.DataSourceAkamai,
     VMware.DataSourceVMware,
+    CloudCIX.DataSourceCloudCIX,
 ]
 
 
@@ -78,21 +92,42 @@ class ExpectedDataSources(test_helpers.TestCase):
     deps_network = [sources.DEP_FILESYSTEM, sources.DEP_NETWORK]
     pkg_list = [type_utils.obj_name(sources)]
 
+    @patch.object(
+        importer,
+        "match_case_insensitive_module_name",
+        lambda name: f"DataSource{name}",
+    )
     def test_expected_default_local_sources_found(self):
         found = sources.list_sources(
-            self.builtin_list, self.deps_local, self.pkg_list
+            self.builtin_list,
+            self.deps_local,
+            self.pkg_list,
         )
         self.assertEqual(set(DEFAULT_LOCAL), set(found))
 
+    @patch.object(
+        importer,
+        "match_case_insensitive_module_name",
+        lambda name: f"DataSource{name}",
+    )
     def test_expected_default_network_sources_found(self):
         found = sources.list_sources(
-            self.builtin_list, self.deps_network, self.pkg_list
+            self.builtin_list,
+            self.deps_network,
+            self.pkg_list,
         )
         self.assertEqual(set(DEFAULT_NETWORK), set(found))
 
+    @patch.object(
+        importer,
+        "match_case_insensitive_module_name",
+        lambda name: f"DataSource{name}",
+    )
     def test_expected_nondefault_network_sources_found(self):
         found = sources.list_sources(
-            ["AliYun"], self.deps_network, self.pkg_list
+            ["AliYun"],
+            self.deps_network,
+            self.pkg_list,
         )
         self.assertEqual(set([AliYun.DataSourceAliYun]), set(found))
 
@@ -106,7 +141,7 @@ class TestDataSourceInvariants(test_helpers.TestCase):
                     " {}".format(str(ds), cfg_src)
                 )
                 self.assertTrue(
-                    hasattr(sources.NetworkConfigSource, cfg_src), fail_msg
+                    isinstance(cfg_src, sources.NetworkConfigSource), fail_msg
                 )
 
     def test_expected_dsname_defined(self):
@@ -118,6 +153,3 @@ class TestDataSourceInvariants(test_helpers.TestCase):
             )
             self.assertNotEqual(ds.dsname, DataSource.dsname, fail_msg)
             self.assertIsNotNone(ds.dsname)
-
-
-# vi: ts=4 expandtab

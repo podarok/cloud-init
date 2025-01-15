@@ -10,7 +10,7 @@ from cloudinit.distros.parsers import chop_comment
 
 
 # Parser that knows how to work with /etc/hostname format
-class HostnameConf(object):
+class HostnameConf:
     def __init__(self, text):
         self._text = text
         self._contents = None
@@ -22,7 +22,7 @@ class HostnameConf(object):
     def __str__(self):
         self.parse()
         contents = StringIO()
-        for (line_type, components) in self._contents:
+        for line_type, components in self._contents:
             if line_type == "blank":
                 contents.write("%s\n" % (components[0]))
             elif line_type == "all_comment":
@@ -39,7 +39,7 @@ class HostnameConf(object):
     @property
     def hostname(self):
         self.parse()
-        for (line_type, components) in self._contents:
+        for line_type, components in self._contents:
             if line_type == "hostname":
                 return components[0]
         return None
@@ -50,7 +50,7 @@ class HostnameConf(object):
             return
         self.parse()
         replaced = False
-        for (line_type, components) in self._contents:
+        for line_type, components in self._contents:
             if line_type == "hostname":
                 components[0] = str(your_hostname)
                 replaced = True
@@ -73,6 +73,3 @@ class HostnameConf(object):
         if len(hostnames_found) > 1:
             raise IOError("Multiple hostnames (%s) found!" % (hostnames_found))
         return entries
-
-
-# vi: ts=4 expandtab
