@@ -14,19 +14,21 @@ Notes:
 """
 
 import base64
-from collections import namedtuple
-from contextlib import suppress as noop
+import ipaddress
+import json
+import logging
+import time
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
-from cloudinit import dmi
-from cloudinit import log as logging
-from cloudinit import net, sources, util
+from cloudinit import atomic_helper, dmi, net, sources, util
+from cloudinit.distros.networking import NetworkConfig
 from cloudinit.net import (
     cmdline,
-    dhcp,
+    ephemeral,
     get_interfaces_by_mac,
     is_netfail_master,
 )
-from cloudinit.url_helper import UrlError, readurl
+from cloudinit.url_helper import wait_for_url
 
 LOG = logging.getLogger(__name__)
 
@@ -35,17 +37,38 @@ BUILTIN_DS_CONFIG = {
     "configure_secondary_nics": False,
 }
 CHASSIS_ASSET_TAG = "OracleCloud.com"
-METADATA_ROOT = "http://169.254.169.254/opc/v{version}/"
-METADATA_PATTERN = METADATA_ROOT + "{path}/"
+IPV4_METADATA_ROOT = "http://169.254.169.254/opc/v{version}/"
+IPV6_METADATA_ROOT = "http://[fd00:c1::a9fe:a9fe]/opc/v{version}/"
+IPV4_METADATA_PATTERN = IPV4_METADATA_ROOT + "{path}/"
+IPV6_METADATA_PATTERN = IPV6_METADATA_ROOT + "{path}/"
+
+V2_HEADERS = {"Authorization": "Bearer Oracle"}
+
 # https://docs.cloud.oracle.com/iaas/Content/Network/Troubleshoot/connectionhang.htm#Overview,
 # indicates that an MTU of 9000 is used within OCI
 MTU = 9000
-V2_HEADERS = {"Authorization": "Bearer Oracle"}
-
-OpcMetadata = namedtuple("OpcMetadata", "version instance_data vnics_data")
 
 
-def _ensure_netfailover_safe(network_config):
+class ReadOpcMetadataResponse(NamedTuple):
+    version: int
+    instance_data: Dict[str, Any]
+    vnics_data: Optional[Dict[str, Any]]
+    imds_url_used: str
+
+
+class KlibcOracleNetworkConfigSource(cmdline.KlibcNetworkConfigSource):
+    """Override super class to lower the applicability conditions.
+
+    If any `/run/net-*.cfg` files exist, then it is applicable. Even if
+    `/run/initramfs/open-iscsi.interface` does not exist.
+    """
+
+    def is_applicable(self) -> bool:
+        """Override is_applicable"""
+        return bool(self._files)
+
+
+def _ensure_netfailover_safe(network_config: NetworkConfig) -> None:
     """
     Search network config physical interfaces to see if any of them are
     a netfailover master.  If found, we prevent matching by MAC as the other
@@ -101,15 +124,19 @@ class DataSourceOracle(sources.DataSource):
 
     dsname = "Oracle"
     system_uuid = None
-    vendordata_pure = None
-    network_config_sources = (
-        sources.NetworkConfigSource.cmdline,
-        sources.NetworkConfigSource.system_cfg,
-        sources.NetworkConfigSource.ds,
-        sources.NetworkConfigSource.initramfs,
+    network_config_sources: Tuple[sources.NetworkConfigSource, ...] = (
+        sources.NetworkConfigSource.CMD_LINE,
+        sources.NetworkConfigSource.SYSTEM_CFG,
+        sources.NetworkConfigSource.DS,
+        sources.NetworkConfigSource.INITRAMFS,
     )
 
-    _network_config = sources.UNSET
+    # for init-local stage, we want to bring up an ephemeral network
+    perform_dhcp_setup = True
+
+    # Careful...these can be overridden in __init__
+    url_max_wait = 30
+    url_timeout = 5
 
     def __init__(self, sys_cfg, *args, **kwargs):
         super(DataSourceOracle, self).__init__(sys_cfg, *args, **kwargs)
@@ -121,41 +148,100 @@ class DataSourceOracle(sources.DataSource):
                 BUILTIN_DS_CONFIG,
             ]
         )
+        self._network_config_source = KlibcOracleNetworkConfigSource()
+        self._network_config: dict = {"config": [], "version": 1}
 
-    def _is_platform_viable(self):
+        url_params = self.get_url_params()
+        self.url_max_wait = url_params.max_wait_seconds
+        self.url_timeout = url_params.timeout_seconds
+
+    def _unpickle(self, ci_pkl_version: int) -> None:
+        super()._unpickle(ci_pkl_version)
+        if not hasattr(self, "_vnics_data"):
+            setattr(self, "_vnics_data", None)
+        if not hasattr(self, "_network_config_source"):
+            setattr(
+                self,
+                "_network_config_source",
+                KlibcOracleNetworkConfigSource(),
+            )
+        if not hasattr(self, "_network_config"):
+            self._network_config = {"config": [], "version": 1}
+
+    def _has_network_config(self) -> bool:
+        return bool(self._network_config.get("config", []))
+
+    @staticmethod
+    def ds_detect() -> bool:
         """Check platform environment to report if this datasource may run."""
         return _is_platform_viable()
 
     def _get_data(self):
-        if not self._is_platform_viable():
-            return False
 
         self.system_uuid = _read_system_uuid()
 
-        # network may be configured if iscsi root.  If that is the case
-        # then read_initramfs_config will return non-None.
-        fetch_vnics_data = self.ds_cfg.get(
+        connectivity_urls_data = (
+            {
+                "url": IPV4_METADATA_PATTERN.format(
+                    version=2, path="instance"
+                ),
+                "headers": V2_HEADERS,
+            },
+            {
+                "url": IPV4_METADATA_PATTERN.format(
+                    version=1, path="instance"
+                ),
+            },
+            {
+                "url": IPV6_METADATA_PATTERN.format(
+                    version=2, path="instance"
+                ),
+                "headers": V2_HEADERS,
+            },
+            {
+                "url": IPV6_METADATA_PATTERN.format(
+                    version=1, path="instance"
+                ),
+            },
+        )
+
+        if self.perform_dhcp_setup:
+            nic_name = net.find_fallback_nic()
+            network_context = ephemeral.EphemeralIPNetwork(
+                distro=self.distro,
+                interface=nic_name,
+                ipv6=True,
+                ipv4=True,
+                connectivity_urls_data=connectivity_urls_data,
+            )
+        else:
+            network_context = util.nullcontext()
+        fetch_primary_nic = not self._is_iscsi_root()
+        fetch_secondary_nics = self.ds_cfg.get(
             "configure_secondary_nics",
             BUILTIN_DS_CONFIG["configure_secondary_nics"],
         )
-        network_context = noop()
-        if not _is_iscsi_root():
-            network_context = dhcp.EphemeralDHCPv4(
-                iface=net.find_fallback_nic(),
-                connectivity_url_data={
-                    "url": METADATA_PATTERN.format(version=2, path="instance"),
-                    "headers": V2_HEADERS,
-                },
-            )
+
         with network_context:
             fetched_metadata = read_opc_metadata(
-                fetch_vnics_data=fetch_vnics_data
+                fetch_vnics_data=fetch_primary_nic or fetch_secondary_nics,
+                max_wait=self.url_max_wait,
+                timeout=self.url_timeout,
+                metadata_patterns=[
+                    IPV6_METADATA_PATTERN,
+                    IPV4_METADATA_PATTERN,
+                ],
             )
 
-        data = self._crawled_metadata = fetched_metadata.instance_data
-        self.metadata_address = METADATA_ROOT.format(
-            version=fetched_metadata.version
+        if not fetched_metadata:
+            return False
+        # set the metadata root address that worked to allow for detecting
+        # whether ipv4 or ipv6 was used for getting metadata
+        self.metadata_address = _get_versioned_metadata_base_url(
+            url=fetched_metadata.imds_url_used
         )
+
+        data = self._crawled_metadata = fetched_metadata.instance_data
         self._vnics_data = fetched_metadata.vnics_data
 
         self.metadata = {
@@ -176,7 +262,7 @@ class DataSourceOracle(sources.DataSource):
 
         return True
 
-    def check_instance_id(self, sys_cfg):
+    def check_instance_id(self, sys_cfg) -> bool:
         """quickly check (local only) if self.instance_id is still valid
 
         On Oracle, the dmi-provided system uuid differs from the instance-id
@@ -186,59 +272,75 @@ class DataSourceOracle(sources.DataSource):
     def get_public_ssh_keys(self):
         return sources.normalize_pubkey_data(self.metadata.get("public_keys"))
 
+    def _is_iscsi_root(self) -> bool:
+        """Return whether we are on a iscsi machine."""
+        return self._network_config_source.is_applicable()
+
+    def _get_iscsi_config(self) -> dict:
+        return self._network_config_source.render_config()
+
     @property
     def network_config(self):
         """Network config is read from initramfs provided files
 
+        Priority for primary network_config selection:
+        - iscsi
+        - imds
+
         If none is present, then we fall back to fallback configuration.
         """
-        if self._network_config == sources.UNSET:
-            # this is v1
-            self._network_config = cmdline.read_initramfs_config()
+        if self._has_network_config():
+            return self._network_config
 
-            if not self._network_config:
-                # this is now v2
-                self._network_config = self.distro.generate_fallback_config()
+        set_primary = False
+        # this is v1
+        if self._is_iscsi_root():
+            self._network_config = self._get_iscsi_config()
+        if not self._has_network_config():
+            LOG.warning(
+                "Could not obtain network configuration from initramfs. "
+                "Falling back to IMDS."
+            )
+            set_primary = True
 
-            if self.ds_cfg.get(
-                "configure_secondary_nics",
-                BUILTIN_DS_CONFIG["configure_secondary_nics"],
-            ):
-                try:
-                    # Mutate self._network_config to include secondary
-                    # VNICs
-                    self._add_network_config_from_opc_imds()
-                except Exception:
-                    util.logexc(
-                        LOG, "Failed to parse secondary network configuration!"
-                    )
+        set_secondary = self.ds_cfg.get(
+            "configure_secondary_nics",
+            BUILTIN_DS_CONFIG["configure_secondary_nics"],
+        )
+        if set_primary or set_secondary:
+            try:
+                # Mutate self._network_config to include primary and/or
+                # secondary VNICs
+                self._add_network_config_from_opc_imds(set_primary)
+            except Exception:
+                util.logexc(
+                    LOG,
+                    "Failed to parse IMDS network configuration!",
+                )
 
-            # we need to verify that the nic selected is not a netfail over
-            # device and, if it is a netfail master, then we need to avoid
-            # emitting any match by mac
-            _ensure_netfailover_safe(self._network_config)
+        # we need to verify that the nic selected is not a netfail over
+        # device and, if it is a netfail master, then we need to avoid
+        # emitting any match by mac
+        _ensure_netfailover_safe(self._network_config)
 
         return self._network_config
 
-    def _add_network_config_from_opc_imds(self):
-        """Generate secondary NIC config from IMDS and merge it.
+    def _add_network_config_from_opc_imds(self, set_primary: bool = False):
+        """Generate primary and/or secondary NIC config from IMDS and merge it.
 
-        The primary NIC configuration should not be modified based on the IMDS
-        values, as it should continue to be configured for DHCP.  As such, this
-        uses the instance's network config dict which is expected to have the
-        primary NIC configuration already present.
         It will mutate the network config to include the secondary VNICs.
 
+        :param set_primary: If True set primary interface.
         :raises:
-            Exceptions are not handled within this function.  Likely
+        Exceptions are not handled within this function.  Likely
             exceptions are KeyError/IndexError
             (if the IMDS returns valid JSON with unexpected contents).
         """
         if self._vnics_data is None:
-            LOG.warning("Secondary NIC data is UNSET but should not be")
+            LOG.warning("NIC data is UNSET but should not be")
             return
 
-        if "nicIndex" in self._vnics_data[0]:
+        if not set_primary and ("nicIndex" in self._vnics_data[0]):
             # TODO: Once configure_secondary_nics defaults to True, lower the
             # level of this log message.  (Currently, if we're running this
             # code at all, someone has explicitly opted-in to secondary
@@ -254,100 +356,226 @@ class DataSourceOracle(sources.DataSource):
 
         interfaces_by_mac = get_interfaces_by_mac()
 
-        for vnic_dict in self._vnics_data[1:]:
-            # We skip the first entry in the response because the primary
-            # interface is already configured by iSCSI boot; applying
-            # configuration from the IMDS is not required.
+        vnics_data = self._vnics_data if set_primary else self._vnics_data[1:]
+
+        # If the metadata address is an IPv6 address
+
+        for index, vnic_dict in enumerate(vnics_data):
+            is_primary = set_primary and index == 0
             mac_address = vnic_dict["macAddr"].lower()
+            is_ipv6_only = vnic_dict.get(
+                "ipv6SubnetCidrBlock", False
+            ) and not vnic_dict.get("privateIp", False)
             if mac_address not in interfaces_by_mac:
-                LOG.debug(
-                    "Interface with MAC %s not found; skipping", mac_address
+                LOG.warning(
+                    "Interface with MAC %s not found; skipping",
+                    mac_address,
                 )
                 continue
             name = interfaces_by_mac[mac_address]
+            if is_ipv6_only:
+                network = ipaddress.ip_network(
+                    vnic_dict["ipv6Addresses"][0],
+                )
+            else:
+                network = ipaddress.ip_network(vnic_dict["subnetCidrBlock"])
 
             if self._network_config["version"] == 1:
-                subnet = {
-                    "type": "static",
-                    "address": vnic_dict["privateIp"],
-                }
-                self._network_config["config"].append(
-                    {
-                        "name": name,
-                        "type": "physical",
-                        "mac_address": mac_address,
-                        "mtu": MTU,
-                        "subnets": [subnet],
-                    }
-                )
-            elif self._network_config["version"] == 2:
-                self._network_config["ethernets"][name] = {
-                    "addresses": [vnic_dict["privateIp"]],
+                if is_primary:
+                    if is_ipv6_only:
+                        subnets = [{"type": "dhcp6"}]
+                    else:
+                        subnets = [{"type": "dhcp"}]
+                else:
+                    subnets = []
+                    if vnic_dict.get("privateIp"):
+                        subnets.append(
+                            {
+                                "type": "static",
+                                "address": (
+                                    f"{vnic_dict['privateIp']}/"
+                                    f"{network.prefixlen}"
+                                ),
+                            }
+                        )
+                    if vnic_dict.get("ipv6Addresses"):
+                        subnets.append(
+                            {
+                                "type": "static",
+                                "address": (
+                                    f"{vnic_dict['ipv6Addresses'][0]}/"
+                                    f"{network.prefixlen}"
+                                ),
+                            }
+                        )
+                interface_config = {
+                    "name": name,
+                    "type": "physical",
+                    "mac_address": mac_address,
                     "mtu": MTU,
-                    "dhcp4": False,
-                    "dhcp6": False,
+                    "subnets": subnets,
+                }
+                self._network_config["config"].append(interface_config)
+            elif self._network_config["version"] == 2:
+                # Why does this elif exist???
+                # Are there plans to switch to v2?
+                interface_config = {
+                    "mtu": MTU,
                     "match": {"macaddress": mac_address},
                 }
+                self._network_config["ethernets"][name] = interface_config
+
+                interface_config["dhcp6"] = is_primary and is_ipv6_only
+                interface_config["dhcp4"] = is_primary and not is_ipv6_only
+                if not is_primary:
+                    interface_config["addresses"] = []
+                    if vnic_dict.get("privateIp"):
+                        interface_config["addresses"].append(
+                            f"{vnic_dict['privateIp']}/{network.prefixlen}"
+                        )
+                    if vnic_dict.get("ipv6Addresses"):
+                        interface_config["addresses"].append(
+                            f"{vnic_dict['ipv6Addresses'][0]}/"
+                            f"{network.prefixlen}"
+                        )
+                self._network_config["ethernets"][name] = interface_config
 
 
-def _read_system_uuid():
+class DataSourceOracleNet(DataSourceOracle):
+    perform_dhcp_setup = False
+
+
+def _is_ipv4_metadata_url(metadata_address: str):
+    if not metadata_address:
+        return False
+    return metadata_address.startswith(IPV4_METADATA_ROOT.split("opc")[0])
+
+
+def _read_system_uuid() -> Optional[str]:
     sys_uuid = dmi.read_dmi_data("system-uuid")
     return None if sys_uuid is None else sys_uuid.lower()
 
 
-def _is_platform_viable():
+def _is_platform_viable() -> bool:
     asset_tag = dmi.read_dmi_data("chassis-asset-tag")
     return asset_tag == CHASSIS_ASSET_TAG
 
 
-def _is_iscsi_root():
-    return bool(cmdline.read_initramfs_config())
+def _url_version(url: str) -> int:
+    return 2 if "/opc/v2/" in url else 1
 
 
-def read_opc_metadata(*, fetch_vnics_data: bool = False):
-    """Fetch metadata from the /opc/ routes.
+def _headers_cb(url: str) -> Optional[Dict[str, str]]:
+    return V2_HEADERS if _url_version(url) == 2 else None
 
-    :return:
-        A namedtuple containing:
-          The metadata version as an integer
-          The JSON-decoded value of the instance data endpoint on the IMDS
-          The JSON-decoded value of the vnics data endpoint if
-            `fetch_vnics_data` is True, else None
 
+def _get_versioned_metadata_base_url(url: str) -> str:
     """
-    # Per Oracle, there are short windows (measured in milliseconds) throughout
-    # an instance's lifetime where the IMDS is being updated and may 404 as a
-    # result.  To work around these windows, we retry a couple of times.
-    retries = 2
+    Remove everything following the version number in the metadata address.
+    """
+    if not url:
+        return url
+    if "v2" in url:
+        return url.split("v2")[0] + "v2/"
+    elif "v1" in url:
+        return url.split("v1")[0] + "v1/"
+    else:
+        raise ValueError("Invalid metadata address: " + url)
 
-    def _fetch(metadata_version: int, path: str) -> dict:
-        return readurl(
-            url=METADATA_PATTERN.format(version=metadata_version, path=path),
-            headers=V2_HEADERS if metadata_version > 1 else None,
-            retries=retries,
-        )._response.json()
 
-    metadata_version = 2
-    try:
-        instance_data = _fetch(metadata_version, path="instance")
-    except UrlError:
-        metadata_version = 1
-        instance_data = _fetch(metadata_version, path="instance")
+def read_opc_metadata(
+    *,
+    fetch_vnics_data: bool = False,
+    max_wait=DataSourceOracle.url_max_wait,
+    timeout=DataSourceOracle.url_timeout,
+    metadata_patterns: List[str] = [IPV4_METADATA_PATTERN],
+) -> Optional[ReadOpcMetadataResponse]:
+    """
+    Fetch metadata from the /opc/ routes from the IMDS.
+
+    Returns:
+        Optional[ReadOpcMetadataResponse]: If fetching metadata fails, None.
+            If fetching metadata succeeds, a namedtuple containing:
+            - The metadata version as an integer
+            - The JSON-decoded value of the instance data from the IMDS
+            - The JSON-decoded value of the vnics data from the IMDS if
+                `fetch_vnics_data` is True, else None. Alternatively,
+                None if fetching metadata failed
+            - The url that was used to fetch the metadata.
+                This allows for later determining if v1 or v2 endppoint was
+                used and whether the IMDS was reached via IPv4 or IPv6.
+    """
+    urls = [
+        metadata_pattern.format(version=version, path="instance")
+        for version in [2, 1]
+        for metadata_pattern in metadata_patterns
+    ]
+
+    LOG.debug("Attempting to fetch IMDS metadata from: %s", urls)
+    start_time = time.monotonic()
+    url_that_worked, instance_response = wait_for_url(
+        urls=urls,
+        max_wait=max_wait,
+        timeout=timeout,
+        headers_cb=_headers_cb,
+        sleep_time=0.1,
+        connect_synchronously=True,
+    )
+    if not url_that_worked:
+        LOG.warning(
+            "Failed to fetch IMDS metadata from any of: %s",
+            ", ".join(urls),
+        )
+        return None
+    else:
+        LOG.debug(
+            "Successfully fetched instance metadata from IMDS at: %s",
+            url_that_worked,
+        )
+    instance_data = json.loads(instance_response.decode("utf-8"))
+
+    # save whichever version we got the instance data from for vnics data later
+    metadata_version = _url_version(url_that_worked)
 
     vnics_data = None
     if fetch_vnics_data:
-        try:
-            vnics_data = _fetch(metadata_version, path="vnics")
-        except UrlError:
-            util.logexc(
-                LOG, "Failed to fetch secondary network configuration!"
+        # This allows us to go over the max_wait time by the timeout length,
+        # but if we were able to retrieve instance metadata, that seems
+        # like a worthwhile tradeoff rather than having incomplete metadata.
+        vnics_url, vnics_response = wait_for_url(
+            urls=[url_that_worked.replace("instance", "vnics")],
+            max_wait=max_wait - (time.monotonic() - start_time),
+            timeout=timeout,
+            headers_cb=_headers_cb,
+            sleep_time=0.1,
+            connect_synchronously=True,
+        )
+        if vnics_url:
+            vnics_data = json.loads(vnics_response.decode("utf-8"))
+            LOG.debug(
+                "Successfully fetched vnics metadata from IMDS at: %s",
+                vnics_url,
             )
-    return OpcMetadata(metadata_version, instance_data, vnics_data)
+        else:
+            LOG.warning("Failed to fetch IMDS network configuration!")
+    return ReadOpcMetadataResponse(
+        metadata_version,
+        instance_data,
+        vnics_data,
+        url_that_worked,
+    )
 
 
 # Used to match classes to dependencies
 datasources = [
     (DataSourceOracle, (sources.DEP_FILESYSTEM,)),
+    (
+        DataSourceOracleNet,
+        (
+            sources.DEP_FILESYSTEM,
+            sources.DEP_NETWORK,
+        ),
+    ),
 ]
 
 
@@ -357,22 +585,22 @@ def get_datasource_list(depends):
 
 
 if __name__ == "__main__":
-    import argparse
 
     description = """
         Query Oracle Cloud metadata and emit a JSON object with two keys:
         `read_opc_metadata` and `_is_platform_viable`.  The values of each are
         the return values of the corresponding functions defined in
         DataSourceOracle.py."""
-    parser = argparse.ArgumentParser(description=description)
-    parser.parse_args()
+
     print(
-        util.json_dumps(
+        atomic_helper.json_dumps(
             {
-                "read_opc_metadata": read_opc_metadata(),
+                "read_opc_metadata": read_opc_metadata(
+                    metadata_patterns=(
+                        [IPV6_METADATA_PATTERN, IPV4_METADATA_PATTERN]
+                    )
+                ),
                 "_is_platform_viable": _is_platform_viable(),
             }
         )
     )
-
-# vi: ts=4 expandtab
