@@ -6,48 +6,18 @@
 #
 # This file is part of cloud-init. See LICENSE file for license information.
 
-"""
-Phone Home
-----------
-**Summary:** post data to url
+"""Phone Home: Post data to url"""
 
-This module can be used to post data to a remote host after boot is complete.
-If the post url contains the string ``$INSTANCE_ID`` it will be replaced with
-the id of the current instance. Either all data can be posted or a list of
-keys to post. Available keys are:
-
-    - ``pub_key_dsa``
-    - ``pub_key_rsa``
-    - ``pub_key_ecdsa``
-    - ``pub_key_ed25519``
-    - ``instance_id``
-    - ``hostname``
-    - ``fdqn``
-
-**Internal name:** ``cc_phone_home``
-
-**Module frequency:** per instance
-
-**Supported distros:** all
-
-**Config keys**::
-
-    phone_home:
-        url: http://example.com/$INSTANCE_ID/
-        post:
-            - pub_key_dsa
-            - instance_id
-            - fqdn
-        tries: 10
-"""
+import logging
 
 from cloudinit import templater, url_helper, util
+from cloudinit.cloud import Cloud
+from cloudinit.config import Config
+from cloudinit.config.schema import MetaSchema
+from cloudinit.distros import ALL_DISTROS
 from cloudinit.settings import PER_INSTANCE
 
-frequency = PER_INSTANCE
-
 POST_LIST_ALL = [
-    "pub_key_dsa",
     "pub_key_rsa",
     "pub_key_ecdsa",
     "pub_key_ed25519",
@@ -56,23 +26,32 @@ POST_LIST_ALL = [
     "fqdn",
 ]
 
+meta: MetaSchema = {
+    "id": "cc_phone_home",
+    "distros": [ALL_DISTROS],
+    "frequency": PER_INSTANCE,
+    "activate_by_schema_keys": ["phone_home"],
+}
 
+LOG = logging.getLogger(__name__)
 # phone_home:
-#  url: http://my.foo.bar/$INSTANCE/
+#  url: http://my.foo.bar/{{ v1.instance_id }}/
 #  post: all
 #  tries: 10
 #
 # phone_home:
-#  url: http://my.foo.bar/$INSTANCE_ID/
-#  post: [ pub_key_dsa, pub_key_rsa, pub_key_ecdsa, instance_id, hostname,
+#  url: http://my.foo.bar/{{ v1.instance_id }}/
+#  post: [ pub_key_rsa, pub_key_ecdsa, instance_id, hostname,
 #          fqdn ]
 #
-def handle(name, cfg, cloud, log, args):
-    if len(args) != 0:
+
+
+def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
+    if args:
         ph_cfg = util.read_conf(args[0])
     else:
         if "phone_home" not in cfg:
-            log.debug(
+            LOG.debug(
                 "Skipping module named %s, "
                 "no 'phone_home' configuration found",
                 name,
@@ -81,7 +60,7 @@ def handle(name, cfg, cloud, log, args):
         ph_cfg = cfg["phone_home"]
 
     if "url" not in ph_cfg:
-        log.warning(
+        LOG.warning(
             "Skipping module named %s, "
             "no 'url' found in 'phone_home' configuration",
             name,
@@ -92,11 +71,11 @@ def handle(name, cfg, cloud, log, args):
     post_list = ph_cfg.get("post", "all")
     tries = ph_cfg.get("tries")
     try:
-        tries = int(tries)
-    except Exception:
+        tries = int(tries)  # type: ignore
+    except (ValueError, TypeError):
         tries = 10
         util.logexc(
-            log,
+            LOG,
             "Configuration entry 'tries' is not an integer, using %s instead",
             tries,
         )
@@ -104,24 +83,24 @@ def handle(name, cfg, cloud, log, args):
     if post_list == "all":
         post_list = POST_LIST_ALL
 
-    all_keys = {}
-    all_keys["instance_id"] = cloud.get_instance_id()
-    all_keys["hostname"] = cloud.get_hostname()
-    all_keys["fqdn"] = cloud.get_hostname(fqdn=True)
+    all_keys = {
+        "instance_id": cloud.get_instance_id(),
+        "hostname": cloud.get_hostname().hostname,
+        "fqdn": cloud.get_hostname(fqdn=True).hostname,
+    }
 
     pubkeys = {
-        "pub_key_dsa": "/etc/ssh/ssh_host_dsa_key.pub",
         "pub_key_rsa": "/etc/ssh/ssh_host_rsa_key.pub",
         "pub_key_ecdsa": "/etc/ssh/ssh_host_ecdsa_key.pub",
         "pub_key_ed25519": "/etc/ssh/ssh_host_ed25519_key.pub",
     }
 
-    for (n, path) in pubkeys.items():
+    for n, path in pubkeys.items():
         try:
-            all_keys[n] = util.load_file(path)
+            all_keys[n] = util.load_text_file(path)
         except Exception:
             util.logexc(
-                log, "%s: failed to open, can not phone home that data!", path
+                LOG, "%s: failed to open, can not phone home that data!", path
             )
 
     submit_keys = {}
@@ -130,7 +109,7 @@ def handle(name, cfg, cloud, log, args):
             submit_keys[k] = all_keys[k]
         else:
             submit_keys[k] = None
-            log.warning(
+            LOG.warning(
                 "Requested key %s from 'post'"
                 " configuration list not available",
                 k,
@@ -138,7 +117,7 @@ def handle(name, cfg, cloud, log, args):
 
     # Get them read to be posted
     real_submit_keys = {}
-    for (k, v) in submit_keys.items():
+    for k, v in submit_keys.items():
         if v is None:
             real_submit_keys[k] = "N/A"
         else:
@@ -153,14 +132,11 @@ def handle(name, cfg, cloud, log, args):
         url_helper.read_file_or_url(
             url,
             data=real_submit_keys,
-            retries=tries,
+            retries=tries - 1,
             sec_between=3,
             ssl_details=util.fetch_ssl_details(cloud.paths),
         )
     except Exception:
         util.logexc(
-            log, "Failed to post phone home data to %s in %s tries", url, tries
+            LOG, "Failed to post phone home data to %s in %s tries", url, tries
         )
-
-
-# vi: ts=4 expandtab

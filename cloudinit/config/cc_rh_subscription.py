@@ -3,53 +3,30 @@
 # Author: Brent Baude <bbaude@redhat.com>
 #
 # This file is part of cloud-init. See LICENSE file for license information.
+"""Red Hat Subscription: Register Red Hat Enterprise Linux based system"""
 
-"""
-Red Hat Subscription
---------------------
-**Summary:** register red hat enterprise linux based system
+import logging
 
-Register a Red Hat system either by username and password *or* activation and
-org. Following a sucessful registration, you can auto-attach subscriptions, set
-the service level, add subscriptions based on pool id, enable/disable yum
-repositories based on repo id, and alter the rhsm_baseurl and server-hostname
-in ``/etc/rhsm/rhs.conf``. For more details, see the ``Register Red Hat
-Subscription`` example config.
-
-**Internal name:** ``cc_rh_subscription``
-
-**Module frequency:** per instance
-
-**Supported distros:** rhel, fedora
-
-**Config keys**::
-
-    rh_subscription:
-        username: <username>
-        password: <password>
-        activation-key: <activation key>
-        org: <org number>
-        auto-attach: <true/false>
-        service-level: <service level>
-        add-pool: <list of pool ids>
-        enable-repo: <list of yum repo ids>
-        disable-repo: <list of yum repo ids>
-        rhsm-baseurl: <url>
-        server-hostname: <hostname>
-"""
-
-from cloudinit import log as logging
 from cloudinit import subp, util
+from cloudinit.cloud import Cloud
+from cloudinit.config import Config
+from cloudinit.config.schema import MetaSchema
+from cloudinit.settings import PER_INSTANCE
 
 LOG = logging.getLogger(__name__)
 
-distros = ["fedora", "rhel"]
+meta: MetaSchema = {
+    "id": "cc_rh_subscription",
+    "distros": ["fedora", "rhel", "openeuler"],
+    "frequency": PER_INSTANCE,
+    "activate_by_schema_keys": ["rh_subscription"],
+}
 
 
-def handle(name, cfg, _cloud, log, _args):
-    sm = SubscriptionManager(cfg, log=log)
+def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
+    sm = SubscriptionManager(cfg, log=LOG)
     if not sm.is_configured():
-        log.debug("%s: module not configured.", name)
+        LOG.debug("%s: module not configured.", name)
         return None
 
     if not sm.is_registered():
@@ -104,7 +81,7 @@ class SubscriptionError(Exception):
     pass
 
 
-class SubscriptionManager(object):
+class SubscriptionManager:
     valid_rh_keys = [
         "org",
         "activation-key",
@@ -353,7 +330,7 @@ class SubscriptionManager(object):
         """
 
         # An empty list was passed
-        if len(pools) == 0:
+        if not pools:
             self.log.debug("No pools to attach")
             return True
 
@@ -402,7 +379,7 @@ class SubscriptionManager(object):
             return False
 
         # Bail if both lists are not populated
-        if (len(erepos) == 0) and (len(drepos) == 0):
+        if not (erepos) and not (drepos):
             self.log.debug("No repo IDs to enable or disable")
             return True
 
@@ -472,11 +449,8 @@ class SubscriptionManager(object):
 
 def _sub_man_cli(cmd, logstring_val=False):
     """
-    Uses the prefered cloud-init subprocess def of subp.subp
+    Uses the preferred cloud-init subprocess def of subp.subp
     and runs subscription-manager.  Breaking this to a
     separate function for later use in mocking and unittests
     """
     return subp.subp(["subscription-manager"] + cmd, logstring=logstring_val)
-
-
-# vi: ts=4 expandtab

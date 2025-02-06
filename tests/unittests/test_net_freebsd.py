@@ -1,8 +1,9 @@
 import os
 
+import yaml
+
 import cloudinit.net
 import cloudinit.net.network_state
-from cloudinit import safeyaml
 from tests.unittests.helpers import CiTestCase, dir2dict, mock, readResource
 
 SAMPLE_FREEBSD_IFCONFIG_OUT = readResource("netinfo/freebsd-ifconfig-output")
@@ -15,6 +16,14 @@ config:
     subnets:
     -   address: 172.20.80.129/25
         type: static
+    type: physical
+-   id: eno2
+    mac_address: 08:94:ef:51:ae:e1
+    mtu: 1470
+    name: eno2
+    subnets:
+    -   address: fd12:3456:789a:1::1/64
+        type: static6
     type: physical
 version: 1
 """
@@ -60,13 +69,15 @@ class TestFreeBSDRoundTrip(CiTestCase):
         renderer.render_network_state(ns, target=target)
         return dir2dict(target)
 
-    @mock.patch("cloudinit.subp.subp")
-    def test_render_output_has_yaml(self, mock_subp):
-
+    @mock.patch(
+        "cloudinit.subp.subp", return_value=(SAMPLE_FREEBSD_IFCONFIG_OUT, 0)
+    )
+    @mock.patch("cloudinit.util.is_FreeBSD", return_value=True)
+    def test_render_output_has_yaml(self, m_is_freebsd, m_subp):
         entry = {
             "yaml": V1,
         }
-        network_config = safeyaml.load(entry["yaml"])
+        network_config = yaml.safe_load(entry["yaml"])
         ns = cloudinit.net.network_state.parse_net_config_data(network_config)
         files = self._render_and_read(state=ns)
         assert files == {
@@ -74,6 +85,8 @@ class TestFreeBSDRoundTrip(CiTestCase):
             "/etc/rc.conf": (
                 "# dummy rc.conf\n"
                 "ifconfig_eno1="
-                "'172.20.80.129 netmask 255.255.255.128 mtu 1470'\n"
+                "'inet 172.20.80.129 netmask 255.255.255.128 mtu 1470'\n"
+                "ifconfig_eno2_ipv6="
+                "'inet6 fd12:3456:789a:1::1/64 mtu 1470'\n"
             ),
         }

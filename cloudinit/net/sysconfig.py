@@ -1,23 +1,23 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 
 import copy
+import glob
 import io
+import logging
 import os
 import re
+from typing import Dict, Optional
 
-from configobj import ConfigObj
-
-from cloudinit import log as logging
 from cloudinit import subp, util
 from cloudinit.distros.parsers import networkmanager_conf, resolv_conf
-
-from . import renderer
-from .network_state import (
+from cloudinit.net import (
     IPV6_DYNAMIC_TYPES,
-    is_ipv6_addr,
+    is_ipv6_address,
     net_prefix_to_ipv4_mask,
+    renderer,
     subnet_is_ipv6,
 )
+from cloudinit.net.network_state import NetworkState
 
 LOG = logging.getLogger(__name__)
 KNOWN_DISTROS = [
@@ -27,21 +27,23 @@ KNOWN_DISTROS = [
     "eurolinux",
     "fedora",
     "miraclelinux",
-    "openEuler",
+    "openeuler",
+    "OpenCloudOS",
+    "openmandriva",
     "rhel",
     "rocky",
     "suse",
+    "TencentOS",
     "virtuozzo",
 ]
-NM_CFG_FILE = "/etc/NetworkManager/NetworkManager.conf"
 
 
 def _make_header(sep="#"):
     lines = [
-        "Created by cloud-init on instance boot automatically, do not edit.",
+        "Created by cloud-init automatically, do not edit.",
         "",
     ]
-    for i in range(0, len(lines)):
+    for i in range(len(lines)):
         if lines[i]:
             lines[i] = sep + " " + lines[i]
         else:
@@ -65,25 +67,7 @@ def _quote_value(value):
         return value
 
 
-def enable_ifcfg_rh(path):
-    """Add ifcfg-rh to NetworkManager.cfg plugins if main section is present"""
-    config = ConfigObj(path)
-    if "main" in config:
-        if "plugins" in config["main"]:
-            if "ifcfg-rh" in config["main"]["plugins"]:
-                return
-        else:
-            config["main"]["plugins"] = []
-
-        if isinstance(config["main"]["plugins"], list):
-            config["main"]["plugins"].append("ifcfg-rh")
-        else:
-            config["main"]["plugins"] = [config["main"]["plugins"], "ifcfg-rh"]
-        config.write()
-        LOG.debug("Enabled ifcfg-rh NetworkManager plugins")
-
-
-class ConfigMap(object):
+class ConfigMap:
     """Sysconfig like dictionary object."""
 
     # Why does redhat prefer yes/no to true/false??
@@ -190,69 +174,59 @@ class Route(ConfigMap):
         # (because Route can contain a mix of IPv4 and IPv6)
         reindex = -1
         for key in sorted(self._conf.keys()):
-            if "ADDRESS" in key:
-                index = key.replace("ADDRESS", "")
-                address_value = str(self._conf[key])
-                # only accept combinations:
-                # if proto ipv6 only display ipv6 routes
-                # if proto ipv4 only display ipv4 routes
-                # do not add ipv6 routes if proto is ipv4
-                # do not add ipv4 routes if proto is ipv6
-                # (this array will contain a mix of ipv4 and ipv6)
-                if proto == "ipv4" and not self.is_ipv6_route(address_value):
-                    netmask_value = str(self._conf["NETMASK" + index])
-                    gateway_value = str(self._conf["GATEWAY" + index])
-                    # increase IPv4 index
-                    reindex = reindex + 1
+            if "ADDRESS" not in key:
+                continue
+
+            index = key.replace("ADDRESS", "")
+            address_value = str(self._conf[key])
+            gateway_value = str(self._conf["GATEWAY" + index])
+
+            # only accept combinations:
+            # if proto ipv6 only display ipv6 routes
+            # if proto ipv4 only display ipv4 routes
+            # do not add ipv6 routes if proto is ipv4
+            # do not add ipv4 routes if proto is ipv6
+            # (this array will contain a mix of ipv4 and ipv6)
+            if proto == "ipv4" and not self.is_ipv6_route(address_value):
+                netmask_value = str(self._conf["NETMASK" + index])
+                # increase IPv4 index
+                reindex = reindex + 1
+                buf.write(
+                    "%s=%s\n"
+                    % ("ADDRESS" + str(reindex), _quote_value(address_value))
+                )
+                buf.write(
+                    "%s=%s\n"
+                    % ("GATEWAY" + str(reindex), _quote_value(gateway_value))
+                )
+                buf.write(
+                    "%s=%s\n"
+                    % ("NETMASK" + str(reindex), _quote_value(netmask_value))
+                )
+                metric_key = "METRIC" + index
+                if metric_key in self._conf:
+                    metric_value = str(self._conf[metric_key])
                     buf.write(
                         "%s=%s\n"
-                        % (
-                            "ADDRESS" + str(reindex),
-                            _quote_value(address_value),
-                        )
+                        % ("METRIC" + str(reindex), _quote_value(metric_value))
                     )
-                    buf.write(
-                        "%s=%s\n"
-                        % (
-                            "GATEWAY" + str(reindex),
-                            _quote_value(gateway_value),
-                        )
+            elif proto == "ipv6" and self.is_ipv6_route(address_value):
+                prefix_value = str(self._conf[f"PREFIX{index}"])
+                metric_value = (
+                    "metric " + str(self._conf["METRIC" + index])
+                    if "METRIC" + index in self._conf
+                    else ""
+                )
+                buf.write(
+                    "%s/%s via %s %s dev %s\n"
+                    % (
+                        address_value,
+                        prefix_value,
+                        gateway_value,
+                        metric_value,
+                        self._route_name,
                     )
-                    buf.write(
-                        "%s=%s\n"
-                        % (
-                            "NETMASK" + str(reindex),
-                            _quote_value(netmask_value),
-                        )
-                    )
-                    metric_key = "METRIC" + index
-                    if metric_key in self._conf:
-                        metric_value = str(self._conf["METRIC" + index])
-                        buf.write(
-                            "%s=%s\n"
-                            % (
-                                "METRIC" + str(reindex),
-                                _quote_value(metric_value),
-                            )
-                        )
-                elif proto == "ipv6" and self.is_ipv6_route(address_value):
-                    netmask_value = str(self._conf["NETMASK" + index])
-                    gateway_value = str(self._conf["GATEWAY" + index])
-                    metric_value = (
-                        "metric " + str(self._conf["METRIC" + index])
-                        if "METRIC" + index in self._conf
-                        else ""
-                    )
-                    buf.write(
-                        "%s/%s via %s %s dev %s\n"
-                        % (
-                            address_value,
-                            netmask_value,
-                            gateway_value,
-                            metric_value,
-                            self._route_name,
-                        )
-                    )
+                )
 
         return buf.getvalue()
 
@@ -343,7 +317,6 @@ class Renderer(renderer.Renderer):
         "rhel": {
             "ONBOOT": True,
             "USERCTL": False,
-            "NM_CONTROLLED": False,
             "BOOTPROTO": "none",
         },
         "suse": {"BOOTPROTO": "static", "STARTMODE": "auto"},
@@ -390,7 +363,7 @@ class Renderer(renderer.Renderer):
         ]
     )
 
-    templates = {}
+    templates: dict = {}
 
     def __init__(self, config=None):
         if not config:
@@ -455,20 +428,20 @@ class Renderer(renderer.Renderer):
             if subnet_type == "dhcp6" or subnet_type == "ipv6_dhcpv6-stateful":
                 if flavor == "suse":
                     # User wants dhcp for both protocols
-                    if iface_cfg["BOOTPROTO"] == "dhcp4":
+                    if iface_cfg["BOOTPROTO"] in ("dhcp4", "dhcp"):
                         iface_cfg["BOOTPROTO"] = "dhcp"
                     else:
                         # Only IPv6 is DHCP, IPv4 may be static
                         iface_cfg["BOOTPROTO"] = "dhcp6"
                     iface_cfg["DHCLIENT6_MODE"] = "managed"
                 # only if rhel AND dhcpv6 stateful
-                elif (
-                    flavor == "rhel" and subnet_type == "ipv6_dhcpv6-stateful"
+                elif flavor == "rhel" and (
+                    subnet_type == "ipv6_dhcpv6-stateful"
                 ):
-                    iface_cfg["BOOTPROTO"] = "dhcp"
                     iface_cfg["DHCPV6C"] = True
                     iface_cfg["IPV6INIT"] = True
                     iface_cfg["IPV6_AUTOCONF"] = False
+                    iface_cfg["IPV6_FAILURE_FATAL"] = True
                 else:
                     iface_cfg["IPV6INIT"] = True
                     # Configure network settings using DHCPv6
@@ -476,7 +449,7 @@ class Renderer(renderer.Renderer):
             elif subnet_type == "ipv6_dhcpv6-stateless":
                 if flavor == "suse":
                     # User wants dhcp for both protocols
-                    if iface_cfg["BOOTPROTO"] == "dhcp4":
+                    if iface_cfg["BOOTPROTO"] in ("dhcp4", "dhcp"):
                         iface_cfg["BOOTPROTO"] = "dhcp"
                     else:
                         # Only IPv6 is DHCP, IPv4 may be static
@@ -494,7 +467,7 @@ class Renderer(renderer.Renderer):
             elif subnet_type == "ipv6_slaac":
                 if flavor == "suse":
                     # User wants dhcp for both protocols
-                    if iface_cfg["BOOTPROTO"] == "dhcp4":
+                    if iface_cfg["BOOTPROTO"] in ("dhcp4", "dhcp"):
                         iface_cfg["BOOTPROTO"] = "dhcp"
                     else:
                         # Only IPv6 is DHCP, IPv4 may be static
@@ -507,10 +480,10 @@ class Renderer(renderer.Renderer):
             elif subnet_type in ["dhcp4", "dhcp"]:
                 bootproto_in = iface_cfg["BOOTPROTO"]
                 iface_cfg["BOOTPROTO"] = "dhcp"
-                if flavor == "suse" and subnet_type == "dhcp4":
+                if flavor == "suse":
                     # If dhcp6 is already specified the user wants dhcp
                     # for both protocols
-                    if bootproto_in != "dhcp6":
+                    if bootproto_in not in ("dhcp6", "dhcp"):
                         # Only IPv4 is DHCP, IPv6 may be static
                         iface_cfg["BOOTPROTO"] = "dhcp4"
             elif subnet_type in ["static", "static6"]:
@@ -575,7 +548,12 @@ class Renderer(renderer.Renderer):
             subnet_type = subnet.get("type")
             # metric may apply to both dhcp and static config
             if "metric" in subnet:
-                if flavor != "suse":
+                if flavor == "rhel":
+                    if subnet_is_ipv6(subnet):
+                        iface_cfg["IPV6_ROUTE_METRIC"] = subnet["metric"]
+                    else:
+                        iface_cfg["IPV4_ROUTE_METRIC"] = subnet["metric"]
+                elif flavor != "suse":
                     iface_cfg["METRIC"] = subnet["metric"]
             if subnet_type in ["dhcp", "dhcp4"]:
                 # On SUSE distros 'DHCLIENT_SET_DEFAULT_ROUTE' is a global
@@ -617,7 +595,7 @@ class Renderer(renderer.Renderer):
 
                 if "gateway" in subnet and flavor != "suse":
                     iface_cfg["DEFROUTE"] = True
-                    if is_ipv6_addr(subnet["gateway"]):
+                    if is_ipv6_address(subnet["gateway"]):
                         iface_cfg["IPV6_DEFAULTGW"] = subnet["gateway"]
                     else:
                         iface_cfg["GATEWAY"] = subnet["gateway"]
@@ -647,7 +625,9 @@ class Renderer(renderer.Renderer):
         for _, subnet in enumerate(subnets, start=len(iface_cfg.children)):
             subnet_type = subnet.get("type")
             for route in subnet.get("routes", []):
-                is_ipv6 = subnet.get("ipv6") or is_ipv6_addr(route["gateway"])
+                is_ipv6 = subnet.get("ipv6") or is_ipv6_address(
+                    route["gateway"]
+                )
 
                 # Any dynamic configuration method, slaac, dhcpv6-stateful/
                 # stateless should get router information from router RA's.
@@ -664,12 +644,9 @@ class Renderer(renderer.Renderer):
                             "Duplicate declaration of default "
                             "route found for interface '%s'" % (iface_cfg.name)
                         )
-                    # NOTE(harlowja): ipv6 and ipv4 default gateways
-                    gw_key = "GATEWAY0"
-                    nm_key = "NETMASK0"
-                    addr_key = "ADDRESS0"
-                    # The owning interface provides the default route.
-                    #
+                    # NOTE that instead of defining the route0 settings,
+                    # the owning interface provides the default route.
+
                     # TODO(harlowja): add validation that no other iface has
                     # also provided the default route?
                     iface_cfg["DEFROUTE"] = True
@@ -683,29 +660,37 @@ class Renderer(renderer.Renderer):
                             iface_cfg["GATEWAY"] = route["gateway"]
                             route_cfg.has_set_default_ipv4 = True
                     if "metric" in route:
-                        iface_cfg["METRIC"] = route["metric"]
+                        if flavor == "rhel":
+                            if subnet_is_ipv6(subnet):
+                                iface_cfg["IPV6_ROUTE_METRIC"] = route[
+                                    "metric"
+                                ]
+                            else:
+                                iface_cfg["IPV4_ROUTE_METRIC"] = route[
+                                    "metric"
+                                ]
+                        else:
+                            iface_cfg["METRIC"] = route["metric"]
 
                 else:
-                    gw_key = "GATEWAY%s" % route_cfg.last_idx
-                    nm_key = "NETMASK%s" % route_cfg.last_idx
-                    addr_key = "ADDRESS%s" % route_cfg.last_idx
-                    metric_key = "METRIC%s" % route_cfg.last_idx
-                    route_cfg.last_idx += 1
                     # add default routes only to ifcfg files, not
                     # to route-* or route6-*
-                    for (old_key, new_key) in [
-                        ("gateway", gw_key),
-                        ("metric", metric_key),
-                        ("netmask", nm_key),
-                        ("network", addr_key),
+                    for old_key, new_name in [
+                        ("gateway", "GATEWAY"),
+                        ("metric", "METRIC"),
+                        ("prefix", "PREFIX"),
+                        ("netmask", "NETMASK"),
+                        ("network", "ADDRESS"),
                     ]:
                         if old_key in route:
+                            new_key = f"{new_name}{route_cfg.last_idx}"
                             route_cfg[new_key] = route[old_key]
+                    route_cfg.last_idx += 1
 
     @classmethod
     def _render_bonding_opts(cls, iface_cfg, iface, flavor):
         bond_opts = []
-        for (bond_key, value_tpl) in cls.bond_tpl_opts:
+        for bond_key, value_tpl in cls.bond_tpl_opts:
             # Seems like either dash or underscore is possible?
             bond_keys = [bond_key, bond_key.replace("_", "-")]
             for bond_key in bond_keys:
@@ -733,9 +718,10 @@ class Renderer(renderer.Renderer):
     def _render_physical_interfaces(
         cls, network_state, iface_contents, flavor
     ):
-        physical_filter = renderer.filter_by_physical
-        for iface in network_state.iter_interfaces(physical_filter):
-            iface_name = iface["name"]
+        for iface in network_state.iter_interfaces(
+            renderer.filter_by_type("physical")
+        ):
+            iface_name = iface.get("config_id") or iface["name"]
             iface_subnets = iface.get("subnets", [])
             iface_cfg = iface_contents[iface_name]
             route_cfg = iface_cfg.routes
@@ -854,20 +840,64 @@ class Renderer(renderer.Renderer):
 
     @staticmethod
     def _render_dns(network_state, existing_dns_path=None):
-        # skip writing resolv.conf if network_state doesn't include any input.
+
+        found_nameservers = []
+        found_dns_search = []
+
+        for iface in network_state.iter_interfaces():
+            for subnet in iface["subnets"]:
+                # Add subnet-level DNS
+                if "dns_nameservers" in subnet:
+                    found_nameservers.extend(subnet["dns_nameservers"])
+                if "dns_search" in subnet:
+                    found_dns_search.extend(subnet["dns_search"])
+
+            # Add interface-level DNS
+            if "dns" in iface:
+                found_nameservers += [
+                    dns
+                    for dns in iface["dns"]["nameservers"]
+                    if dns not in found_nameservers
+                ]
+                found_dns_search += [
+                    search
+                    for search in iface["dns"]["search"]
+                    if search not in found_dns_search
+                ]
+
+        # When both global and interface specific entries are present,
+        # use them both to generate /etc/resolv.conf eliminating duplicate
+        # entries. Otherwise use global or interface specific entries whichever
+        # is provided.
+        if network_state.dns_nameservers:
+            found_nameservers += [
+                nameserver
+                for nameserver in network_state.dns_nameservers
+                if nameserver not in found_nameservers
+            ]
+        if network_state.dns_searchdomains:
+            found_dns_search += [
+                search
+                for search in network_state.dns_searchdomains
+                if search not in found_dns_search
+            ]
+
+        # skip writing resolv.conf if no dns information is provided in conf.
         if not any(
             [
-                len(network_state.dns_nameservers),
-                len(network_state.dns_searchdomains),
+                len(found_nameservers),
+                len(found_dns_search),
             ]
         ):
             return None
         content = resolv_conf.ResolvConf("")
         if existing_dns_path and os.path.isfile(existing_dns_path):
-            content = resolv_conf.ResolvConf(util.load_file(existing_dns_path))
-        for nameserver in network_state.dns_nameservers:
+            content = resolv_conf.ResolvConf(
+                util.load_text_file(existing_dns_path)
+            )
+        for nameserver in found_nameservers:
             content.add_nameserver(nameserver)
-        for searchdomain in network_state.dns_searchdomains:
+        for searchdomain in found_dns_search:
             content.add_search_domain(searchdomain)
         header = _make_header(";")
         content_str = str(content)
@@ -877,21 +907,46 @@ class Renderer(renderer.Renderer):
 
     @staticmethod
     def _render_networkmanager_conf(network_state, templates=None):
+        iface_dns = False
         content = networkmanager_conf.NetworkManagerConf("")
+        # check if there is interface specific DNS information configured
+        for iface in network_state.iter_interfaces():
+            for subnet in iface["subnets"]:
+                if "dns_nameservers" in subnet or "dns_search" in subnet:
+                    iface_dns = True
+                    break
+            if (
+                not iface_dns
+                and "dns" in iface
+                and (iface["dns"]["nameservers"] or iface["dns"]["search"])
+            ):
+                iface_dns = True
+                break
 
-        # If DNS server information is provided, configure
-        # NetworkManager to not manage dns, so that /etc/resolv.conf
-        # does not get clobbered.
-        if network_state.dns_nameservers:
+        # If DNS server and/or dns search information is provided either
+        # globally or per interface basis, configure NetworkManager to
+        # not manage dns, so that /etc/resolv.conf does not get clobbered.
+        # This is not required for NetworkManager renderer as it
+        # does not write /etc/resolv.conf directly. DNS information is
+        # written to the interface keyfile and NetworkManager is then
+        # responsible for using the DNS information from the keyfile,
+        # including managing /etc/resolv.conf.
+        if (
+            network_state.dns_nameservers
+            or network_state.dns_searchdomains
+            or iface_dns
+        ):
             content.set_section_keypair("main", "dns", "none")
 
-        if len(content) == 0:
+        if not content:
             return None
         out = "".join([_make_header(), "\n", "\n".join(content.write()), "\n"])
         return out
 
     @classmethod
-    def _render_bridge_interfaces(cls, network_state, iface_contents, flavor):
+    def _render_bridge_interfaces(
+        cls, network_state: NetworkState, iface_contents, flavor
+    ):
         bridge_key_map = {
             old_k: new_k
             for old_k, new_k in cls.cfg_key_maps[flavor].items()
@@ -972,23 +1027,29 @@ class Renderer(renderer.Renderer):
 
     @classmethod
     def _render_sysconfig(
-        cls, base_sysconf_dir, network_state, flavor, templates=None
+        cls,
+        base_sysconf_dir,
+        network_state: NetworkState,
+        flavor,
+        templates=None,
     ):
         """Given state, return /etc/sysconfig files + contents"""
         if not templates:
             templates = cls.templates
-        iface_contents = {}
+        iface_contents: Dict[str, NetInterface] = {}
         for iface in network_state.iter_interfaces():
             if iface["type"] == "loopback":
                 continue
-            iface_name = iface["name"]
-            iface_cfg = NetInterface(iface_name, base_sysconf_dir, templates)
+            config_id: str = iface.get("config_id") or iface["name"]
+            iface_cfg = NetInterface(
+                iface["name"], base_sysconf_dir, templates
+            )
             if flavor == "suse":
                 iface_cfg.drop("DEVICE")
                 # If type detection fails it is considered a bug in SUSE
                 iface_cfg.drop("TYPE")
             cls._render_iface_shared(iface, iface_cfg, flavor)
-            iface_contents[iface_name] = iface_cfg
+            iface_contents[config_id] = iface_cfg
         cls._render_physical_interfaces(network_state, iface_contents, flavor)
         cls._render_bond_interfaces(network_state, iface_contents, flavor)
         cls._render_vlan_interfaces(network_state, iface_contents, flavor)
@@ -1010,7 +1071,12 @@ class Renderer(renderer.Renderer):
                         contents[cpath] = iface_cfg.routes.to_string(proto)
         return contents
 
-    def render_network_state(self, network_state, templates=None, target=None):
+    def render_network_state(
+        self,
+        network_state: NetworkState,
+        templates: Optional[dict] = None,
+        target=None,
+    ) -> None:
         if not templates:
             templates = self.templates
         file_mode = 0o644
@@ -1038,9 +1104,12 @@ class Renderer(renderer.Renderer):
         if self.netrules_path:
             netrules_content = self._render_persistent_net(network_state)
             netrules_path = subp.target_path(target, self.netrules_path)
-            util.write_file(netrules_path, netrules_content, file_mode)
-        if available_nm(target=target):
-            enable_ifcfg_rh(subp.target_path(target, path=NM_CFG_FILE))
+            util.write_file(
+                netrules_path,
+                content=netrules_content,
+                mode=file_mode,
+                preserve_mode=True,
+            )
 
         sysconfig_path = subp.target_path(target, templates.get("control"))
         # Distros configuring /etc/sysconfig/network as a file e.g. Centos
@@ -1070,10 +1139,23 @@ def _supported_vlan_names(rdev, vid):
 
 
 def available(target=None):
-    sysconfig = available_sysconfig(target=target)
-    nm = available_nm(target=target)
-    return util.system_info()["variant"] in KNOWN_DISTROS and any(
-        [nm, sysconfig]
+    if util.system_info()["variant"] not in KNOWN_DISTROS:
+        return False
+    if available_sysconfig(target):
+        return True
+    if available_nm_ifcfg_rh(target):
+        return True
+    return False
+
+
+def available_nm_ifcfg_rh(target=None):
+    # The ifcfg-rh plugin of NetworkManager is installed.
+    # NetworkManager can handle the ifcfg files.
+    return glob.glob(
+        subp.target_path(
+            target,
+            "usr/lib*/NetworkManager/*/libnm-settings-plugin-ifcfg-rh.so",
+        )
     )
 
 
@@ -1092,12 +1174,3 @@ def available_sysconfig(target=None):
         if os.path.isfile(subp.target_path(target, p)):
             return True
     return False
-
-
-def available_nm(target=None):
-    if not os.path.isfile(subp.target_path(target, path=NM_CFG_FILE)):
-        return False
-    return True
-
-
-# vi: ts=4 expandtab

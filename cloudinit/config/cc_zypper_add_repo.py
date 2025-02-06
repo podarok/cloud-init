@@ -3,110 +3,33 @@
 #
 # This file is part of cloud-init. See LICENSE file for license information.
 
-"""zypper_add_repo: Add zyper repositories to the system"""
+"""zypper_add_repo: Add zypper repositories to the system"""
 
+import logging
 import os
-from textwrap import dedent
 
 import configobj
 
-from cloudinit import log as logging
 from cloudinit import util
-from cloudinit.config.schema import get_meta_doc
+from cloudinit.cloud import Cloud
+from cloudinit.config import Config
+from cloudinit.config.schema import MetaSchema
 from cloudinit.settings import PER_ALWAYS
 
-distros = ["opensuse", "sles"]
-
-meta = {
+meta: MetaSchema = {
     "id": "cc_zypper_add_repo",
-    "name": "ZypperAddRepo",
-    "title": "Configure zypper behavior and add zypper repositories",
-    "description": dedent(
-        """\
-        Configure zypper behavior by modifying /etc/zypp/zypp.conf. The
-        configuration writer is "dumb" and will simply append the provided
-        configuration options to the configuration file. Option settings
-        that may be duplicate will be resolved by the way the zypp.conf file
-        is parsed. The file is in INI format.
-        Add repositories to the system. No validation is performed on the
-        repository file entries, it is assumed the user is familiar with
-        the zypper repository file format."""
-    ),
-    "distros": distros,
-    "examples": [
-        dedent(
-            """\
-        zypper:
-          repos:
-            - id: opensuse-oss
-              name: os-oss
-              baseurl: http://dl.opensuse.org/dist/leap/v/repo/oss/
-              enabled: 1
-              autorefresh: 1
-            - id: opensuse-oss-update
-              name: os-oss-up
-              baseurl: http://dl.opensuse.org/dist/leap/v/update
-              # any setting per
-              # https://en.opensuse.org/openSUSE:Standards_RepoInfo
-              # enable and autorefresh are on by default
-          config:
-            reposdir: /etc/zypp/repos.dir
-            servicesdir: /etc/zypp/services.d
-            download.use_deltarpm: true
-            # any setting in /etc/zypp/zypp.conf
-    """
-        )
+    "distros": [
+        "opensuse",
+        "opensuse-microos",
+        "opensuse-tumbleweed",
+        "opensuse-leap",
+        "sle_hpc",
+        "sle-micro",
+        "sles",
     ],
     "frequency": PER_ALWAYS,
+    "activate_by_schema_keys": ["zypper"],
 }
-
-schema = {
-    "type": "object",
-    "properties": {
-        "zypper": {
-            "type": "object",
-            "properties": {
-                "repos": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "type": "string",
-                                "description": dedent(
-                                    """\
-                                    The unique id of the repo, used when
-                                     writing
-                                    /etc/zypp/repos.d/<id>.repo."""
-                                ),
-                            },
-                            "baseurl": {
-                                "type": "string",
-                                "format": "uri",  # built-in format type
-                                "description": "The base repositoy URL",
-                            },
-                        },
-                        "required": ["id", "baseurl"],
-                        "additionalProperties": True,
-                    },
-                    "minItems": 1,
-                },
-                "config": {
-                    "type": "object",
-                    "description": dedent(
-                        """\
-                        Any supported zypo.conf key is written to
-                        /etc/zypp/zypp.conf'"""
-                    ),
-                },
-            },
-            "minProperties": 1,  # Either config or repo must be provided
-            "additionalProperties": False,  # only repos and config allowed
-        }
-    },
-}
-
-__doc__ = get_meta_doc(meta, schema)  # Supplement python help()
 
 LOG = logging.getLogger(__name__)
 
@@ -131,7 +54,7 @@ def _format_repository_config(repo_id, repo_config):
     to_be = configobj.ConfigObj()
     to_be[repo_id] = {}
     # Do basic translation of the items -> values
-    for (k, v) in repo_config.items():
+    for k, v in repo_config.items():
         # For now assume that people using this know the format
         # of zypper repos  and don't verify keys/values further
         to_be[repo_id][k] = _format_repo_value(v)
@@ -192,7 +115,7 @@ def _write_repos(repos, repo_base_path):
 
         valid_repos[repo_id] = (repo_fn_pth, repo_config)
 
-    for (repo_id, repo_data) in valid_repos.items():
+    for repo_id, repo_data in valid_repos.items():
         repo_blob = _format_repository_config(repo_id, repo_data[-1])
         util.write_file(repo_data[0], repo_blob)
 
@@ -202,7 +125,7 @@ def _write_zypp_config(zypper_config):
     if not zypper_config:
         return
     zypp_config = "/etc/zypp/zypp.conf"
-    zypp_conf_content = util.load_file(zypp_config)
+    zypp_conf_content = util.load_text_file(zypp_config)
     new_settings = ["# Added via cloud.cfg"]
     for setting, value in zypper_config.items():
         if setting == "configdir":
@@ -219,7 +142,7 @@ def _write_zypp_config(zypper_config):
     util.write_file(zypp_config, new_config)
 
 
-def handle(name, cfg, _cloud, log, _args):
+def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
     zypper_section = cfg.get("zypper")
     if not zypper_section:
         LOG.debug(
@@ -239,6 +162,3 @@ def handle(name, cfg, _cloud, log, _args):
 
     _write_zypp_config(zypper_config)
     _write_repos(repos, repo_base_path)
-
-
-# vi: ts=4 expandtab

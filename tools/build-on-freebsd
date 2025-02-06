@@ -23,7 +23,6 @@ pkgs="
     bash
     e2fsprogs
     $py_prefix-Jinja2
-    $py_prefix-boto
     $py_prefix-configobj
     $py_prefix-jsonpatch
     $py_prefix-jsonpointer
@@ -31,7 +30,7 @@ pkgs="
     $py_prefix-oauthlib
     $py_prefix-requests
     $py_prefix-pyserial
-    $py_prefix-yaml
+    $py_prefix-pyyaml
     sudo
 "
 [ -f "$depschecked" ] || pkg install --yes ${pkgs} || fail "install packages"
